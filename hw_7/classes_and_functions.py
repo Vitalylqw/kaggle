@@ -14,6 +14,12 @@ from scipy.stats import ttest_rel
 from sklearn.metrics import r2_score, roc_auc_score
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split, cross_val_score
 from sklearn.model_selection import TimeSeriesSplit
+from  lightgbm import LGBMClassifier
+from bayes_opt import BayesianOptimization
+from sklearn.preprocessing import LabelEncoder
+import time
+
+
 
 
 class PSI(BaseEstimator, TransformerMixin):
@@ -377,6 +383,7 @@ def xgb_param_rnd_test(x,y,x_v,y_v,num):
         pred = model.predict_proba(x_v)[:,1]
         met = metrika(y_v,pred)
         params['auc'] = met
+        params['n_estimators'] = model.best_iteration_
         res = res.append(params,ignore_index=True)
         
     return res.sort_values('auc',ascending=False)     
@@ -418,6 +425,7 @@ def cb_param_rnd_test(x,y,x_v,y_v,num,cat_columns=[]):
         pred = model.predict_proba(x_v)[:,1]
         met = metrika(y_v,pred)
         params['auc'] = met
+        params['n_estimators'] = model.best_iteration_
         res = res.append(params,ignore_index=True)
     return res.sort_values('auc',ascending=False)    
 
@@ -687,8 +695,299 @@ def make_cross_validation_cb(X,y,estimator, metric, cv_strategy):
     oof_score = metric(y, oof_predictions)
     print(f"CV-results train: {round(np.mean(fold_train_scores), 4)} +/- {round(np.std(fold_train_scores), 3)}")
     print(f"CV-results valid: {round(np.mean(fold_valid_scores), 4)} +/- {round(np.std(fold_valid_scores), 3)}")
-    print(f"CV-results train: {round(np.mean(fold_train_scores), 4)} +/- {round(np.std(fold_train_scores), 3)}")
-    print(f"CV-results valid: {round(np.mean(fold_valid_scores), 4)} +/- {round(np.std(fold_valid_scores), 3)}")
     print(f"OOF-score = {round(oof_score, 4)}")
 
     return estimators, oof_score, fold_train_scores, fold_valid_scores, oof_predictions 
+
+
+
+
+# def make_cross_validation_cb(X,y,estimator, metric, cv_strategy):
+#     estimators, fold_train_scores, fold_valid_scores = [], [], []
+#     oof_predictions = np.zeros(X.shape[0])
+
+#     for fold_number, (train_idx, valid_idx) in enumerate(cv_strategy.split(X, y)):
+#         x_train, x_valid = X.iloc[train_idx], X.iloc[valid_idx]
+#         y_train, y_valid = y.iloc[train_idx], y.iloc[valid_idx]
+
+#         estimator.fit(x_train, y_train, \
+#           eval_set=[(x_train, y_train),(x_valid,y_valid)],early_stopping_rounds  = 50,verbose=None) 
+
+#         y_valid_pred = estimator.predict_proba(x_valid)[:,1]
+# #         return estimator
+#         fold_train_scores.append(estimator.best_score_['training']['auc'])
+#         fold_valid_scores.append(estimator.best_score_['valid_1']['auc'])
+#         oof_predictions[valid_idx] = y_valid_pred
+
+#         msg = (
+#             f"Fold: {fold_number+1}, train-observations = {len(train_idx)}, "
+#             f"valid-observations = {len(valid_idx)}\n"
+#             f"train-score = {round(fold_train_scores[fold_number], 4)}, "
+#             f"valid-score = {round(fold_valid_scores[fold_number], 4)}" 
+#         )
+#         print(msg)
+#         print("="*69)
+#         estimators.append(estimator)
+
+#     oof_score = metric(y, oof_predictions)
+#     print(f"CV-results train: {round(np.mean(fold_train_scores), 4)} +/- {round(np.std(fold_train_scores), 3)}")
+#     print(f"CV-results valid: {round(np.mean(fold_valid_scores), 4)} +/- {round(np.std(fold_valid_scores), 3)}")
+#     print(f"CV-results train: {round(np.mean(fold_train_scores), 4)} +/- {round(np.std(fold_train_scores), 3)}")
+#     print(f"CV-results valid: {round(np.mean(fold_valid_scores), 4)} +/- {round(np.std(fold_valid_scores), 3)}")
+#     print(f"OOF-score = {round(oof_score, 4)}")
+
+#     return estimators, oof_score, fold_train_scores, fold_valid_scores, oof_predictions 
+
+    
+def test_hold_out_rnd(X,Y,model, n=50,t_s=0.2):
+    result  = []
+    for i in range(20):
+        x,x_v, y,y_v = train_test_split(X,Y,test_size= t_s,random_state = i)
+        model.fit(x,y)
+        pred = model.predict_proba(x_v)[:,1]
+        result.append(roc_auc_score(y_v,pred))
+    result = np.array(result)
+    return result.mean(),result.std(),result.min(),result.max()
+
+
+def xgboost_cross_validation(params, X, y, cv, categorical = None,if_print = True):
+    """
+    Кросс-валидация для модели catbooost.
+
+    Parameters
+    ----------
+    params: dict
+        Словарь гиперпараметров модели.
+
+    X: pandas.core.frame.DataFrame
+        Матрица признако для обучения модели.
+
+    y: pandas.core.frame.Series
+        Вектор целевой переменной для обучения модели.
+
+    cv: KFold or StratifiedKFold generator.
+        Объект KFold / StratifiedKFold для определения
+        стратегии кросс-валидации модели.
+
+    categorical: str, optional, default = None
+        Список категориальных признаков.
+        Опциональный параметр, по умолчанию, не используется.
+
+    Returns
+    -------
+    estimators: list
+        Список с объектами обученной модели.
+
+    encoders: dict
+        Список с объектами LabelEncoders.
+
+    oof_preds: np.array
+        Вектор OOF-прогнозов.
+
+    """
+    estimators, encoders = [], {}
+    oof_preds = np.zeros(X.shape[0])
+
+    if categorical:
+        for feature in categorical:
+            encoder = LabelEncoder()
+            X[feature] = encoder.fit_transform(X[feature].astype("str").fillna("NA"))
+            encoders[feature] = encoder
+    if if_print:
+        print(f"{time.ctime()}, Cross-Validation, {X.shape[0]} rows, {X.shape[1]} cols")
+
+    for fold, (train_idx, valid_idx) in enumerate(cv.split(X, y)):
+
+        x_train, x_valid = X.loc[train_idx], X.loc[valid_idx]
+        y_train, y_valid = y[train_idx], y[valid_idx]
+        dtrain = xgb.DMatrix(x_train, y_train)
+        dvalid = xgb.DMatrix(x_valid, y_valid)
+
+        model = xgb.train(
+            params=params,
+            dtrain=dtrain,
+            maximize=True,
+            num_boost_round=10000,
+            early_stopping_rounds=25,
+            evals=[(dtrain, "train"), (dvalid, "valid")],
+            verbose_eval=False,
+        )
+        oof_preds[valid_idx] = model.predict(dvalid)
+        score = roc_auc_score(y_valid, oof_preds[valid_idx])
+        if if_print:
+            print(f"Fold {fold+1}, Valid score = {round(score, 5)}")
+        estimators.append(model)
+    oof_score = roc_auc_score(y,oof_preds)    
+    print('oof_score - ',oof_score)
+    return oof_score,estimators, encoders, oof_preds
+
+
+
+
+class LGBMClassifier_optimize_params():
+
+    def __init__(self,X,Y,**param):
+        from  lightgbm import LGBMClassifier
+        from bayes_opt import BayesianOptimization
+        from sklearn.metrics import  roc_auc_score
+        from sklearn.model_selection import train_test_split
+        self.params = param
+        n = 0.2
+        self.rnd =2
+        if 'n' in param.keys():
+            n = param['n']
+        if 'rnd' in param.keys():
+            rnd = param['rnd']    
+        self.x ,self.x_v, self.y,self.y_v = train_test_split(X,Y,\
+                                                     test_size= n,random_state = self.rnd)
+        
+        
+    def get_work_params(self,params,s_params):
+        
+        for k,i in s_params.items():
+            if k == "max_depth":
+                params["max_depth"] = int(i)
+            elif k == "num_leaves":     
+                params["num_leaves"] = int(i)
+            elif k == "min_child_weight":
+                params["min_child_weight"] = i
+            elif k == "subsample_for_bin":
+                params["subsample_for_bin"] = int(i)
+            elif k == "min_child_samples":
+                params["min_child_samples"] = int(i)
+            elif k == "subsample": 
+                params["subsample"] = i
+            elif k == "colsample_bytree": 
+                params["colsample_bytree"] = i
+            elif k == "reg_alpha": 
+                params["reg_alpha"] = i
+            elif k == "reg_lambda": 
+                params["reg_lambda"] = i
+            elif k == "n_estimators": 
+                params["n_estimators"] = i
+            elif k == "learning_rate": 
+                params["learning_rate"] = i 
+
+    def lgb_optimize_params(self,**s_params):
+
+        params = {}
+        params['n_estimators'] = 4000
+        params['learning_rate'] = 0.2
+        self.get_work_params(params,s_params) 
+
+    
+        model = LGBMClassifier(**params)
+        model.fit(self.x, self.y, eval_set=[(self.x, self.y),(self.x_v,self.y_v)],\
+                                  eval_metric = 'auc',early_stopping_rounds = 90,verbose=None) 
+        pred = model.predict_proba(self.x_v)[:,1]
+
+        return roc_auc_score(self.y_v, pred)    
+    
+    def run(self,params_search,init_points=10, n_iter=1000, acq='ei'):
+        self.lgm_params_search = BayesianOptimization(
+                self.lgb_optimize_params,
+                pbounds=  params_search,
+                random_state=self.rnd)
+        self.lgm_params_search.maximize(init_points=init_points, n_iter=n_iter, acq=acq
+        )
+        
+        res = self.lgm_params_search.max
+        self.best_target = res['target']
+        self.best_params = {}
+        self.get_work_params(self.best_params,res['params'])
+  
+    
+        
+        return self.best_target, self.best_params, self.lgm_params_search
+    
+
+
+    
+
+
+
+class XGBoost_optimize_params():
+
+    def __init__(self,X,Y,cat_f,**param):
+        self.X = X
+        self.Y = Y
+        self.cat_f = cat_f
+        self.params = param
+        self.cat_f = cat_f
+        n = 0.2
+        self.rnd =2
+        if 'n' in param.keys():
+            n = param['n']
+        if 'rnd' in param.keys():
+            rnd = param['rnd']    
+        self.x ,self.x_v, self.y,self.y_v = train_test_split(X,Y,\
+                                                     test_size= n,random_state = self.rnd)
+    def get_work_params(self,params,s_params):
+        
+        for k,i in s_params.items():
+            if k == "max_depth":
+                params["max_depth"] = int(i)
+            elif k == "min_child_weight":
+                params["min_child_weight"] = i
+            elif k == "subsample_for_bin":
+                params["subsample_for_bin"] = int(i)
+            elif k == "min_child_samples":
+                params["min_child_samples"] = int(i)
+            elif k == "subsample": 
+                params["subsample"] = i
+            elif k == "colsample_bytree": 
+                params["colsample_bytree"] = i
+            elif k == "reg_alpha": 
+                params["reg_alpha"] = i
+            elif k == "reg_lambda": 
+                params["reg_lambda"] = i
+            elif k == "colsample_bylevel": 
+                params["colsample_bylevel"] = i
+            elif k == "gamma": 
+                params["gamma"] = i   
+            elif k == "random_seed": 
+                params["random_seed"] = i 
+            elif k == "n_estimators": 
+                params["n_estimators"] = i
+            elif k == "learning_rate": 
+                params["learning_rate"] = i 
+
+    def lgb_optimize_params(self,**s_params):
+        
+
+        params = {}
+        params['n_estimators'] = 5000
+        params['learning_rate'] = 0.1
+        params['n_jobs'] = 15
+        params['verbosity'] = 0
+        params['objective'] = "binary:logistic"
+        params['booster'] = "gbtree"
+        params['eval_metric'] = "auc"
+        params['random_seed'] = 42
+        params['enable_categorical'] = True
+        
+        self.get_work_params(params,s_params) 
+        
+        model=xgb.XGBClassifier(**params)
+        model.fit(self.x, self.y, eval_set=[(self.x, self.y),(self.x_v,self.y_v)],\
+                                  eval_metric = 'auc',early_stopping_rounds = 90,verbose=None) 
+        pred = model.predict_proba(self.x_v)[:,1]
+
+        return roc_auc_score(self.y_v, pred)      
+    
+    def run(self,params_search,init_points=10, n_iter=1000, acq='ei'):
+        self.lgm_params_search = BayesianOptimization(
+                self.lgb_optimize_params,
+                pbounds=  params_search,
+                random_state=self.rnd)
+        self.lgm_params_search.maximize(init_points=init_points, n_iter=n_iter, acq=acq
+        )
+        
+        res = self.lgm_params_search.max
+        self.best_target = res['target']
+        self.best_params = {}
+        self.get_work_params(self.best_params,res['params'])
+  
+    
+        
+        return self.best_target, self.best_params, self.lgm_params_search
