@@ -739,9 +739,9 @@ def make_cross_validation_cb(X,y,estimator, metric, cv_strategy):
 #     return estimators, oof_score, fold_train_scores, fold_valid_scores, oof_predictions 
 
     
-def test_hold_out_rnd(X,Y,model, n=50,t_s=0.2):
+def test_hold_out_rnd(X,Y,model, n=25,t_s=0.2):
     result  = []
-    for i in range(20):
+    for i in range(n):
         x,x_v, y,y_v = train_test_split(X,Y,test_size= t_s,random_state = i)
         model.fit(x,y)
         pred = model.predict_proba(x_v)[:,1]
@@ -991,3 +991,91 @@ class XGBoost_optimize_params():
     
         
         return self.best_target, self.best_params, self.lgm_params_search
+    
+    
+    
+class CatBoostClassifier_optimize_params():
+
+    def __init__(self,X,Y,cat_f,**param):
+        self.X = X
+        self.Y = Y
+        self.cat_f = cat_f
+        self.params = param
+        self.cat_f = cat_f
+        n = 0.2
+        self.rnd =2
+        if 'n' in param.keys():
+            n = param['n']
+        if 'rnd' in param.keys():
+            rnd = param['rnd']    
+        self.x ,self.x_v, self.y,self.y_v = train_test_split(X,Y,\
+                                                     test_size= n,random_state = self.rnd)
+    def get_work_params(self,params,s_params):
+    
+        for k,i in s_params.items():
+            if k == "max_depth":
+                params["max_depth"] = int(i)
+            elif k == "max_ctr_complexity":
+                params["max_ctr_complexity"] = int(i)
+            elif k == "max_bin":
+                params["max_bin"] = int(i)
+            elif k == "min_child_samples":
+                params["min_child_samples"] = int(i)
+            elif k == "subsample": 
+                params["subsample"] = i
+            elif k == "border_count": 
+                params["border_count"] = int(i)
+            elif k == "random_strength": 
+                params["random_strength"] = i
+            elif k == "reg_lambda": 
+                params["reg_lambda"] = i
+            elif k == "bagging_temperature": 
+                params["bagging_temperature"] = i
+            elif k == "l2_leaf_reg": 
+                params["l2_leaf_reg"] = i   
+            elif k == "random_seed": 
+                params["random_seed"] = int(i) 
+            elif k == "n_estimators": 
+                params["n_estimators"] = int(i)
+            elif k == "learning_rate": 
+                params["learning_rate"] = i 
+
+    def cb_optimize_params(self,**s_params):
+        
+
+        params = {}
+        params['n_estimators'] = 5000
+        params['learning_rate'] = 0.1
+        params['thread_count'] = 15
+        params['verbose'] = False
+        params['loss_function'] = "Logloss"
+        params['eval_metric'] = "AUC"
+        params['random_seed'] = 42
+        params['cat_features'] = self.cat_f
+        self.get_work_params(params,s_params) 
+ 
+        
+        model=cb.CatBoostClassifier(**params)
+        model.fit(self.x, self.y, eval_set=[(self.x, self.y),(self.x_v,self.y_v)],early_stopping_rounds = 50,verbose=None) 
+        pred = model.predict_proba(self.x_v)[:,1]
+
+        return roc_auc_score(self.y_v, pred)      
+    
+    def run(self,params_search,init_points=10, n_iter=1000, acq='ei'):
+        self.cb_params_search = BayesianOptimization(
+                self.cb_optimize_params,
+                pbounds=  params_search,
+                random_state=self.rnd)
+        self.cb_params_search.maximize(init_points=init_points, n_iter=n_iter, acq=acq
+        )
+        
+        res = self.cb_params_search.max
+        self.best_target = res['target']
+        self.best_params = {}
+        self.get_work_params(self.best_params,res['params'])
+  
+    
+        
+        return self.best_target, self.best_params, self.cb_params_search    
+    
+    
